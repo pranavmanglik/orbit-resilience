@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import random
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ from time import monotonic
 from typing import Protocol, TypeVar, runtime_checkable
 
 from orbit_resilience._limits import MAX_RESILIENCE_CAPACITY, is_finite_number
+from orbit_resilience.errors import ResilienceError
 from orbit_resilience.rate_limit import (
     RateLimiter,
     RateLimitExceededError,
@@ -44,8 +46,14 @@ class FailureKind(StrEnum):
     UNKNOWN = "unknown"
 
 
-class BulkheadFullError(TimeoutError):
+class BulkheadFullError(ResilienceError, TimeoutError):
     """Raised when a bulkhead cannot admit an operation before its queue deadline."""
+
+    def __init__(self, message: str = "Bulkhead admission capacity was exhausted.") -> None:
+        super().__init__(
+            "resilience.bulkhead-full",
+            message,
+        )
 
 
 @runtime_checkable
@@ -126,12 +134,18 @@ class Deadline:
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """Finite exponential retry schedule with an optional exception predicate."""
+    """Finite exponential retry schedule with proportional jitter.
+
+    ``jitter_ratio`` randomizes each non-zero backoff in the inclusive range around its
+    exponential delay, then ``max_delay`` caps the result. Set it to zero for deterministic
+    timing in applications that specifically require it.
+    """
 
     max_attempts: int = 3
     initial_delay: float = 0.1
     multiplier: float = 2.0
     max_delay: float = 30.0
+    jitter_ratio: float = 0.2
 
     def __post_init__(self) -> None:
         if (
@@ -150,23 +164,30 @@ class RetryPolicy:
             or not isinstance(self.max_delay, (int, float))
             or not is_finite_number(self.max_delay)
             or self.max_delay < 0
+            or isinstance(self.jitter_ratio, bool)
+            or not isinstance(self.jitter_ratio, (int, float))
+            or not is_finite_number(self.jitter_ratio)
+            or not 0 <= self.jitter_ratio <= 1
         ):
             raise ValueError("Retry policy values are invalid.")
 
 
 def _retry_delay(policy: RetryPolicy, attempt: int) -> float:
-    """Return a capped backoff without allowing exponentiation to escape its bounds."""
+    """Return a capped, optionally jittered backoff without unbounded exponentiation."""
     if policy.initial_delay == 0 or policy.max_delay == 0:
         return 0.0
     if policy.initial_delay >= policy.max_delay:
-        return float(policy.max_delay)
-    try:
-        delay = policy.initial_delay * policy.multiplier**attempt
-    except OverflowError:
-        return float(policy.max_delay)
-    return (
-        float(min(policy.max_delay, delay)) if is_finite_number(delay) else float(policy.max_delay)
-    )
+        bounded = policy.max_delay
+    else:
+        try:
+            delay = policy.initial_delay * policy.multiplier**attempt
+        except OverflowError:
+            delay = policy.max_delay
+        bounded = min(policy.max_delay, delay) if is_finite_number(delay) else policy.max_delay
+    if policy.jitter_ratio:
+        factor = random.uniform(1 - policy.jitter_ratio, 1 + policy.jitter_ratio)
+        bounded = min(policy.max_delay, max(0.0, bounded * factor))
+    return float(bounded)
 
 
 async def retry(
@@ -227,6 +248,12 @@ async def resilient_call(
         raise TypeError("circuit must be a CircuitBreaker.")
     if bulkhead is not None and not isinstance(bulkhead, Bulkhead):
         raise TypeError("bulkhead must be a Bulkhead.")
+    if (
+        isinstance(rate_limit_cost, bool)
+        or not isinstance(rate_limit_cost, int)
+        or not 1 <= rate_limit_cost <= MAX_RESILIENCE_CAPACITY
+    ):
+        raise ValueError("rate_limit_cost must be a positive bounded integer.")
 
     if rate_limiter is not None:
         if not isinstance(rate_limiter, RateLimiter):
@@ -234,12 +261,6 @@ async def resilient_call(
         if rate_limit_key is None:
             raise ValueError("rate_limit_key is required when rate_limiter is configured.")
         validate_rate_limit_key(rate_limit_key)
-        if (
-            isinstance(rate_limit_cost, bool)
-            or not isinstance(rate_limit_cost, int)
-            or not 1 <= rate_limit_cost <= MAX_RESILIENCE_CAPACITY
-        ):
-            raise ValueError("rate_limit_cost must be a positive bounded integer.")
         if rate_limit_timeout is not None and (
             isinstance(rate_limit_timeout, bool)
             or not isinstance(rate_limit_timeout, (int, float))
@@ -299,14 +320,147 @@ class CircuitState(StrEnum):
     HALF_OPEN = "half-open"
 
 
-class CircuitOpenError(RuntimeError):
+class CircuitOpenError(ResilienceError, RuntimeError):
     """Raised when a circuit rejects work while open."""
+
+    def __init__(
+        self,
+        message: str = "Circuit breaker is open.",
+        *,
+        code: str = "resilience.circuit-open",
+    ) -> None:
+        super().__init__(code, message)
+
+
+class CircuitStateStoreError(ResilienceError, RuntimeError):
+    """A shared circuit-state backend failed; no local-only fallback is attempted."""
+
+    def __init__(self, message: str, *, operation_attempted: bool = False) -> None:
+        """Record whether an operation was already invoked before state persistence failed."""
+        self.operation_attempted = operation_attempted
+        super().__init__(
+            "resilience.circuit-state-store-failed",
+            message,
+            context={"operation_attempted": operation_attempted},
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitPermit:
+    """One shared-state admission result; the optional probe token is intentionally redacted."""
+
+    epoch: int
+    probe_token: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.epoch, bool)
+            or not isinstance(self.epoch, int)
+            or self.epoch < 0
+            or (
+                self.probe_token is not None
+                and (
+                    not isinstance(self.probe_token, str)
+                    or not self.probe_token
+                    or len(self.probe_token) > 256
+                )
+            )
+        ):
+            raise ValueError("Circuit permit is invalid.")
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitSnapshot:
+    """Immutable state observed from a local or shared circuit breaker."""
+
+    state: CircuitState
+    failures: int
+    epoch: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.state, CircuitState)
+            or isinstance(self.failures, bool)
+            or not isinstance(self.failures, int)
+            or not 0 <= self.failures <= MAX_RESILIENCE_CAPACITY
+            or isinstance(self.epoch, bool)
+            or not isinstance(self.epoch, int)
+            or self.epoch < 0
+        ):
+            raise ValueError("Circuit snapshot is invalid.")
+
+
+@runtime_checkable
+class CircuitStateStore(Protocol):
+    """Atomic shared-state contract for process-independent circuit breakers.
+
+    Adapters must serialize admission and completion transitions, use epochs to ignore stale
+    completions, and allow at most one valid half-open probe at a time. Probe admission is leased
+    for a bounded duration so a crashed worker cannot hold the circuit indefinitely. Store
+    failures must raise a sanitized error; callers must never silently fall back to local state.
+    """
+
+    async def acquire(
+        self,
+        name: str,
+        *,
+        failure_threshold: int,
+        recovery_timeout: float,
+        probe_lease_timeout: float,
+    ) -> CircuitPermit | None:
+        """Admit work or return ``None`` while the circuit is open or already probing."""
+
+    async def record(
+        self,
+        name: str,
+        permit: CircuitPermit,
+        *,
+        succeeded: bool,
+        failure_threshold: int,
+        recovery_timeout: float,
+    ) -> CircuitSnapshot:
+        """Apply a completion only if the permit still belongs to the current breaker epoch."""
+
+    async def abandon_probe(self, name: str, permit: CircuitPermit) -> None:
+        """Release a matching half-open probe after cancellation without changing failure state."""
+
+    async def snapshot(self, name: str) -> CircuitSnapshot:
+        """Return the latest shared state for diagnostics and health reporting."""
+
+
+def _valid_circuit_name(name: str | None) -> bool:
+    """Require a stable, bounded identifier that cannot carry arbitrary log or key data."""
+    return (
+        isinstance(name, str)
+        and 1 <= len(name) <= 128
+        and all(
+            character.isascii() and (character.isalnum() or character in "._:-")
+            for character in name
+        )
+    )
 
 
 class CircuitBreaker:
-    """Protect an operation after consecutive failures with one half-open probe."""
+    """Protect an operation with local or adapter-backed shared circuit state.
 
-    def __init__(self, *, failure_threshold: int = 5, recovery_timeout: float = 30.0) -> None:
+    A shared ``state_store`` and stable ``name`` are required by default so independently hosted
+    workers make admission decisions from the same state. ``local_only=True`` explicitly selects
+    process-local state for tests and single-process deployments. Shared-backend errors fail
+    closed; the breaker never falls back to local state for admission.
+    """
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        state_store: CircuitStateStore | None = None,
+        name: str | None = None,
+        probe_lease_timeout: float = 30.0,
+        local_only: bool = False,
+    ) -> None:
+        if state_store is not None and not isinstance(state_store, CircuitStateStore):
+            raise TypeError("state_store must implement the CircuitStateStore contract.")
         if (
             isinstance(failure_threshold, bool)
             or not isinstance(failure_threshold, int)
@@ -315,8 +469,23 @@ class CircuitBreaker:
             or not isinstance(recovery_timeout, (int, float))
             or not is_finite_number(recovery_timeout)
             or recovery_timeout <= 0
+            or isinstance(probe_lease_timeout, bool)
+            or not isinstance(probe_lease_timeout, (int, float))
+            or not is_finite_number(probe_lease_timeout)
+            or not 0.1 <= probe_lease_timeout <= 600
+            or (state_store is not None and not _valid_circuit_name(name))
+            or (state_store is None and name is not None)
         ):
             raise ValueError("Circuit breaker values are invalid.")
+        if not isinstance(local_only, bool):
+            raise TypeError("local_only must be a boolean.")
+        if state_store is None and not local_only:
+            raise ValueError(
+                "CircuitBreaker requires a shared state_store; pass local_only=True only when "
+                "process-local state is intentional."
+            )
+        if state_store is not None and local_only:
+            raise ValueError("local_only cannot be combined with a shared state_store.")
         self._failure_threshold = failure_threshold
         self._recovery_timeout = recovery_timeout
         self._state = CircuitState.CLOSED
@@ -328,6 +497,9 @@ class CircuitBreaker:
         # when it completes later.
         self._epoch = 0
         self._lock = asyncio.Lock()
+        self._state_store = state_store
+        self._name = name
+        self._probe_lease_timeout = float(probe_lease_timeout)
 
     @property
     def failure_threshold(self) -> int:
@@ -349,8 +521,37 @@ class CircuitBreaker:
         """Return consecutive failures recorded since the last successful call."""
         return self._failures
 
+    async def refresh_state(self) -> CircuitSnapshot:
+        """Refresh the current state snapshot, including the shared state when configured.
+
+        The synchronous ``state`` and ``failures`` properties are last-observed values in shared
+        mode. Use this method for an up-to-date diagnostic snapshot; an observation does not grant
+        admission and must not be used to make a separate call decision.
+        """
+        if self._state_store is None:
+            return CircuitSnapshot(self._state, self._failures, self._epoch)
+        assert self._name is not None
+        try:
+            snapshot = await self._state_store.snapshot(self._name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise CircuitStateStoreError("Circuit state store snapshot failed.") from None
+        if not isinstance(snapshot, CircuitSnapshot):
+            raise CircuitStateStoreError("Circuit state store returned an invalid snapshot.")
+        self._apply_snapshot(snapshot)
+        return snapshot
+
     async def call(self, operation: Operation[T]) -> T:
-        """Execute an operation or reject it while the circuit is open."""
+        """Execute a callable operation or reject it while the circuit is open.
+
+        Validate local input before changing breaker state. Provider or operation exceptions count
+        toward the consecutive-failure threshold; cancellation propagates without changing it.
+        """
+        if not callable(operation):
+            raise TypeError("operation must be callable.")
+        if self._state_store is not None:
+            return await self._shared_call(operation)
         probe = False
         async with self._lock:
             if self._state is CircuitState.OPEN:
@@ -360,7 +561,10 @@ class CircuitBreaker:
                 self._epoch += 1
             if self._state is CircuitState.HALF_OPEN:
                 if self._probe_active:
-                    raise CircuitOpenError("Circuit breaker is probing recovery.")
+                    raise CircuitOpenError(
+                        "Circuit breaker is probing recovery.",
+                        code="resilience.circuit-probe-active",
+                    )
                 self._probe_active = True
                 probe = True
             epoch = self._epoch
@@ -371,6 +575,84 @@ class CircuitBreaker:
                 async with self._lock:
                     self._probe_active = False
         return await self._attempt(operation, epoch)
+
+    async def _shared_call(self, operation: Operation[T]) -> T:
+        """Admit and record one call through the configured atomic shared-state store."""
+        store = self._state_store
+        name = self._name
+        assert store is not None and name is not None
+        try:
+            permit = await store.acquire(
+                name,
+                failure_threshold=self.failure_threshold,
+                recovery_timeout=self.recovery_timeout,
+                probe_lease_timeout=self._probe_lease_timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise CircuitStateStoreError("Circuit state store admission failed.") from None
+        if permit is None:
+            raise CircuitOpenError(
+                "Circuit breaker is open or already probing recovery.",
+                code="resilience.circuit-open",
+            )
+        if not isinstance(permit, CircuitPermit):
+            raise CircuitStateStoreError("Circuit state store returned an invalid permit.")
+
+        try:
+            result = operation()
+            value = await result if inspect.isawaitable(result) else result
+        except asyncio.CancelledError:
+            if permit.probe_token is not None:
+                try:
+                    await asyncio.shield(store.abandon_probe(name, permit))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # The adapter's bounded probe lease eventually releases a crashed/cancelled
+                    # owner's admission. Preserve the operation's cancellation either way.
+                    pass
+            raise
+        except Exception:
+            snapshot = await self._record_shared_outcome(store, name, permit, succeeded=False)
+            self._apply_snapshot(snapshot)
+            raise
+        snapshot = await self._record_shared_outcome(store, name, permit, succeeded=True)
+        self._apply_snapshot(snapshot)
+        return value
+
+    async def _record_shared_outcome(
+        self, store: CircuitStateStore, name: str, permit: CircuitPermit, *, succeeded: bool
+    ) -> CircuitSnapshot:
+        """Persist a completion and preserve explicit ambiguity if that write fails."""
+        try:
+            snapshot = await store.record(
+                name,
+                permit,
+                succeeded=succeeded,
+                failure_threshold=self.failure_threshold,
+                recovery_timeout=self.recovery_timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise CircuitStateStoreError(
+                "Circuit state store could not record an attempted operation.",
+                operation_attempted=True,
+            ) from None
+        if not isinstance(snapshot, CircuitSnapshot):
+            raise CircuitStateStoreError(
+                "Circuit state store returned an invalid completion snapshot.",
+                operation_attempted=True,
+            )
+        return snapshot
+
+    def _apply_snapshot(self, snapshot: CircuitSnapshot) -> None:
+        """Update the last-observed public properties from a validated immutable snapshot."""
+        self._state = snapshot.state
+        self._failures = snapshot.failures
+        self._epoch = snapshot.epoch
 
     async def _attempt(self, operation: Operation[T], epoch: int) -> T:
         try:
@@ -440,7 +722,13 @@ class Bulkhead:
         return self._timeout
 
     async def call(self, operation: Operation[T]) -> T:
-        """Run one operation under the concurrency limit."""
+        """Run one callable operation under the concurrency limit.
+
+        Validate the local callback before waiting for a slot. The semaphore is released in a
+        ``finally`` block for success, failure, and cancellation after admission.
+        """
+        if not callable(operation):
+            raise TypeError("operation must be callable.")
         if self.timeout is None:
             await self._semaphore.acquire()
         else:
@@ -460,7 +748,11 @@ __all__ = [
     "BulkheadFullError",
     "CircuitBreaker",
     "CircuitOpenError",
+    "CircuitPermit",
+    "CircuitSnapshot",
     "CircuitState",
+    "CircuitStateStore",
+    "CircuitStateStoreError",
     "Deadline",
     "DefaultFailureClassifier",
     "FailureClassifier",

@@ -1,17 +1,40 @@
 # Orbit Resilience: security
 
-## Package-specific security guidance
+These utilities change how application operations wait and repeat. They do not provide
+authentication, authorization, distributed abuse prevention, or transactional rollback.
 
-The README does not define separate package-specific security guarantees. Follow the implemented API and provider documentation; do not infer security properties that are not documented and tested.
+## Rate limits are not access controls
 
-## Credentials and sensitive data
+`AsyncRateLimiter` is process-local and stores a bounded LRU set of keys. When key capacity is
+exceeded, old bucket state is evicted. An attacker able to create high-cardinality keys can cause
+quota history to be discarded; multiple workers also maintain independent buckets. Do not use it
+as the sole control for login throttling, billing quotas, abuse prevention, or other security
+requirements. Use a shared limiter with an explicitly reviewed failure mode and enforce
+authorization independently.
 
-Use least-privilege credentials and a secret manager for provider secrets. Do not commit secrets, tokens, private keys, personal data, request bodies, raw provider errors, or opaque cursors. Enable TLS certificate verification for remote services unless package documentation gives a narrowly scoped local-development exception.
+Rate-limit keys are retained in memory. Do not include passwords, access tokens, or unnecessary
+personal data. Keep keys stable and low-cardinality, and avoid logging raw key values.
 
-## Vulnerability disclosure
+## Retries and side effects
 
-Follow the repository [security policy](../../SECURITY.md). Do not post vulnerability details in public issues. The policy describes private reporting alternatives without claiming that a hosting-platform setting is enabled.
+Retries can duplicate an operation whose remote completion was not observed by the caller.
+Protect non-idempotent writes with server-supported idempotency keys or application deduplication.
+Do not retry authentication failures, validation failures, or unknown exceptions without a
+provider-specific reason. Cancellation is propagated to the caller, but cancellation does not
+roll back a request already accepted by a remote service.
 
-## Limits
+## Deadlines and resource bounds
 
-This page records source and package documentation, not an independent security audit. Validate the package, its provider SDKs, and its deployment configuration before production use.
+Deadlines constrain asynchronous waiting and execution. A blocking synchronous function can stall
+the event loop and cannot be interrupted by `asyncio.timeout`; use an async client or a bounded
+executor. Bound bulkhead waiters and concurrency at the application level, and use the bulkhead
+with client pool limits so queued work does not exhaust memory.
+
+## Diagnostics
+
+These classes do not log operation arguments or caught exceptions. Application instrumentation
+should record safe operation names and classifications without recording credentials, request
+bodies, personal data, or unbounded rate-limit keys.
+
+Follow the repository [security policy](../../SECURITY.md) for private vulnerability reporting.
+This guidance is not a security review of an application that composes these utilities.

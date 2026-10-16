@@ -23,6 +23,7 @@ from typing import Protocol, runtime_checkable
 from unicodedata import category
 
 from orbit_resilience._limits import MAX_RESILIENCE_CAPACITY, is_finite_number
+from orbit_resilience.errors import ResilienceError
 
 _MAX_PERIOD = 31_536_000.0
 
@@ -43,7 +44,7 @@ class _Bucket:
     updated_at: float
 
 
-class RateLimitExceededError(TimeoutError):
+class RateLimitExceededError(ResilienceError, TimeoutError):
     """Raised when the caller's allowed wait expires before a token is available."""
 
     def __init__(self, retry_after: float) -> None:
@@ -55,7 +56,11 @@ class RateLimitExceededError(TimeoutError):
         ):
             raise ValueError("retry_after must be finite and nonnegative.")
         self.retry_after = float(retry_after)
-        super().__init__("Rate-limit wait exceeded its configured timeout.")
+        super().__init__(
+            "resilience.rate-limit-exceeded",
+            "Rate-limit wait exceeded its configured timeout.",
+            context={"retry_after_seconds": self.retry_after},
+        )
 
 
 def validate_rate_limit_key(key: str) -> None:

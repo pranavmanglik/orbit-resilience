@@ -13,13 +13,18 @@
 # limitations under the License.
 """Optional retry, deadline, rate-limit, circuit-breaker, and bulkhead controls for Orbit apps."""
 
+from orbit_resilience.errors import ResilienceError
 from orbit_resilience.rate_limit import AsyncRateLimiter, RateLimiter, RateLimitExceededError
 from orbit_resilience.resilience import (
     Bulkhead,
     BulkheadFullError,
     CircuitBreaker,
     CircuitOpenError,
+    CircuitPermit,
+    CircuitSnapshot,
     CircuitState,
+    CircuitStateStore,
+    CircuitStateStoreError,
     Deadline,
     DefaultFailureClassifier,
     FailureClassifier,
@@ -35,12 +40,17 @@ __all__ = [
     "AsyncRateLimiter",
     "CircuitBreaker",
     "CircuitOpenError",
+    "CircuitPermit",
+    "CircuitSnapshot",
     "CircuitState",
+    "CircuitStateStore",
+    "CircuitStateStoreError",
     "DefaultFailureClassifier",
     "Deadline",
     "FailureClassifier",
     "FailureKind",
     "RetryPolicy",
+    "ResilienceError",
     "RateLimitExceededError",
     "RateLimiter",
     "resilient_call",

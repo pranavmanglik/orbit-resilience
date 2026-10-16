@@ -16,6 +16,7 @@
 import asyncio
 
 import pytest
+from orbit.errors import ErrorCategory, OrbitError
 
 from orbit_resilience import (
     AsyncRateLimiter,
@@ -24,12 +25,32 @@ from orbit_resilience import (
     CircuitBreaker,
     CircuitOpenError,
     CircuitState,
+    CircuitStateStoreError,
     Deadline,
+    RateLimitExceededError,
+    ResilienceError,
     RetryPolicy,
     resilient_call,
     retry,
 )
 from orbit_resilience.resilience import DefaultFailureClassifier, FailureKind
+
+
+def test_operational_errors_use_core_problem_contract_and_keep_builtin_categories() -> None:
+    errors: list[Exception] = [
+        CircuitOpenError(),
+        CircuitStateStoreError("state write failed", operation_attempted=True),
+        BulkheadFullError(),
+        RateLimitExceededError(0.25),
+    ]
+    assert all(isinstance(error, OrbitError) for error in errors)
+    assert all(isinstance(error, ResilienceError) for error in errors)
+    assert all(error.problem.category is ErrorCategory.RUNTIME for error in errors)
+    assert isinstance(errors[0], RuntimeError)
+    assert isinstance(errors[2], TimeoutError)
+    assert isinstance(errors[3], TimeoutError)
+    assert errors[1].problem.context["operation_attempted"] is True
+    assert errors[3].problem.context["retry_after_seconds"] == 0.25
 
 
 @pytest.mark.asyncio
@@ -63,6 +84,42 @@ async def test_retry_backoff_saturates_after_exponentiation_overflow():
     assert attempts == 4
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("factor", "expected"), [(0.5, [0.5, 1.0]), (1.5, [1.5, 2.0])])
+async def test_retry_applies_bounded_jitter_before_the_maximum_cap(
+    monkeypatch: pytest.MonkeyPatch, factor: float, expected: list[float]
+) -> None:
+    delays: list[float] = []
+    attempts = 0
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise ConnectionError("temporary")
+        return "ok"
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr("orbit_resilience.resilience.random.uniform", lambda low, high: factor)
+
+    result = await retry(
+        operation,
+        RetryPolicy(
+            max_attempts=3,
+            initial_delay=1,
+            multiplier=2,
+            max_delay=2,
+            jitter_ratio=0.5,
+        ),
+    )
+
+    assert result == "ok"
+    assert delays == expected
+
+
 @pytest.mark.parametrize(
     "factory",
     [
@@ -82,9 +139,20 @@ def test_reliability_boundaries_reject_unrepresentably_large_integers(factory) -
         factory()
 
 
+def test_circuit_breaker_requires_shared_state_or_explicit_local_mode() -> None:
+    """Prevent applications from silently creating per-process breaker decisions."""
+    with pytest.raises(ValueError, match="requires a shared state_store"):
+        CircuitBreaker()
+
+    local = CircuitBreaker(local_only=True)
+    assert local.state is CircuitState.CLOSED
+    with pytest.raises(TypeError, match="local_only"):
+        CircuitBreaker(local_only=1)  # type: ignore[arg-type]
+
+
 @pytest.mark.asyncio
 async def test_circuit_breaker_opens_and_recovers():
-    breaker = CircuitBreaker(failure_threshold=2, recovery_timeout=0.01)
+    breaker = CircuitBreaker(failure_threshold=2, recovery_timeout=0.01, local_only=True)
     with pytest.raises(AttributeError):
         breaker.failure_threshold = 1  # type: ignore[misc]
     with pytest.raises(AttributeError):
@@ -105,8 +173,19 @@ async def test_circuit_breaker_opens_and_recovers():
 
 
 @pytest.mark.asyncio
+async def test_circuit_breaker_rejects_non_callable_without_counting_failure() -> None:
+    """A caller configuration error must not open a dependency circuit."""
+    breaker = CircuitBreaker(failure_threshold=1, local_only=True)
+    with pytest.raises(TypeError, match="callable"):
+        await breaker.call(None)  # type: ignore[arg-type]
+    assert breaker.state is CircuitState.CLOSED
+    assert breaker.failures == 0
+    assert await breaker.call(lambda: "healthy") == "healthy"
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_allows_only_one_half_open_probe():
-    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0.001)
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0.001, local_only=True)
 
     async def failing():
         raise RuntimeError("down")
@@ -132,7 +211,7 @@ async def test_circuit_breaker_allows_only_one_half_open_probe():
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_ignores_stale_success_after_newer_failures_open_it():
-    breaker = CircuitBreaker(failure_threshold=2, recovery_timeout=1)
+    breaker = CircuitBreaker(failure_threshold=2, recovery_timeout=1, local_only=True)
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -184,10 +263,19 @@ async def test_bulkhead_limits_concurrency_and_releases_on_failure():
 
 
 @pytest.mark.asyncio
+async def test_bulkhead_rejects_non_callable_before_admission() -> None:
+    """Invalid local callbacks fail before waiting for shared concurrency capacity."""
+    bulkhead = Bulkhead(1)
+    with pytest.raises(TypeError, match="callable"):
+        await bulkhead.call(None)  # type: ignore[arg-type]
+    assert await bulkhead.call(lambda: "slot remains available") == "slot remains available"
+
+
+@pytest.mark.asyncio
 async def test_bulkhead_capacity_rejection_does_not_trip_circuit_or_retry() -> None:
     """Local admission timeouts are resource failures, not provider outages."""
     bulkhead = Bulkhead(1, timeout=0.01)
-    circuit = CircuitBreaker(failure_threshold=1)
+    circuit = CircuitBreaker(failure_threshold=1, local_only=True)
     entered = asyncio.Event()
     release = asyncio.Event()
     provider_calls = 0
@@ -361,6 +449,21 @@ async def test_resilient_call_validates_options_before_rate_admission(option) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cost", [True, 1.0])
+async def test_unused_rate_limit_cost_still_requires_integer_contract(cost) -> None:
+    """A misleading unused option must not pass validation through bool/int equality."""
+    invoked = False
+
+    def operation() -> None:
+        nonlocal invoked
+        invoked = True
+
+    with pytest.raises(ValueError, match="rate_limit_cost"):
+        await resilient_call(operation, rate_limit_cost=cost)  # type: ignore[arg-type]
+    assert not invoked
+
+
+@pytest.mark.asyncio
 async def test_resilient_call_rejects_noncallable_before_rate_admission() -> None:
     """An invalid operation cannot consume a provider's rate capacity."""
     limiter = AsyncRateLimiter(1, 60)
@@ -419,6 +522,9 @@ def test_failure_classifier_and_policy_validation():
         lambda: RetryPolicy(multiplier="1"),
         lambda: RetryPolicy(max_delay=True),
         lambda: RetryPolicy(max_delay="1"),
+        lambda: RetryPolicy(jitter_ratio=True),
+        lambda: RetryPolicy(jitter_ratio=-0.1),
+        lambda: RetryPolicy(jitter_ratio=1.1),
         lambda: CircuitBreaker(failure_threshold=True),
         lambda: CircuitBreaker(failure_threshold="1"),
         lambda: CircuitBreaker(recovery_timeout=True),

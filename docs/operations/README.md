@@ -1,58 +1,57 @@
-# Orbit Resilience: operations and security
+# Orbit Resilience: operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
+This package has no environment-variable configuration, provider clients, or background lifecycle.
+Construct policies alongside the application component that uses them. All in-memory state is
+local to one Python process and is lost on restart.
 
-## Configuration surface
+## Choosing values
 
-Environment names found in the package README:
+- Set the overall `Deadline` from the caller's remaining request or job budget, leaving time for
+  response handling and cleanup.
+- Count `RetryPolicy.max_attempts` including the initial attempt. Keep backoff under the remaining
+  deadline and avoid retrying operations that cannot safely repeat. Its default `jitter_ratio=0.2`
+  spreads each delay by up to 20%; set the ratio to zero only when deterministic timing is needed.
+- Size a `Bulkhead` for the dependency's concurrency and connection-pool limits. Its timeout is
+  only an admission-wait bound.
+- Choose `CircuitBreaker.failure_threshold` and `recovery_timeout` based on dependency behavior.
+  Separate breaker instances isolate unrelated dependencies. A shared `CircuitStateStore` is
+  required by default; use `local_only=True` only when one-process state is intentional.
+- Install a shared adapter such as `orbit-cache-redis` and use the same stable circuit name and
+  policy values in every worker. Set `probe_lease_timeout` above the operation's maximum deadline
+  plus completion-write latency. Shared-store errors fail closed; persistence failure after
+  invocation sets `operation_attempted=True`, so inspect the operation's idempotency contract
+  before retrying.
+- `AsyncRateLimiter` limits one in-process instance. Its LRU key bound trades memory for discarded
+  key history; it cannot provide tenant quotas across workers or withstand key-cardinality churn
+  as a strict quota.
 
-The package README does not name `ORBIT_*` variables. Use its typed constructors and application configuration, and confirm exact runtime inputs in the implementation before deployment.
+## Composition behavior
 
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
+Use `resilient_call` to validate policy types and arguments once before work begins. Every retry
+reacquires rate capacity. The deadline includes that wait and retry backoff. Bulkhead capacity is
+released in `finally`, including cancellation. A bulkhead rejection does not count against the
+circuit or trigger a retry under the default classifier.
 
-## Lifecycle, failure behavior, and limits
+Apply one policy composition per logical operation. Avoid wrapping an already retried client in a
+second retry policy; nested retries multiply attempts and delay. Track attempts, rate-wait time,
+bulkhead rejections, breaker state, and deadline exhaustion with application metrics.
 
-`orbit-resilience` is an optional package of bounded async resilience utilities: deadlines,
-token-bucket backpressure, retry policies, circuit breakers, bulkheads, and failure classification. These utilities are not
-required to use Orbit Core; Core retains its own lifecycle, request, and cleanup timeouts.
-`resilient_call` validates all supplied policies and the operation before rate-limit capacity is
-acquired, so a malformed local configuration cannot consume provider quota.
+## Failure and idempotency
 
-```bash
-pip install orbit-resilience
-```
+Choose the retry classifier from the client's actual exception contract. Provider adapters may
+classify a throttling response as transient when their SDK identifies it reliably and the operation
+is safe to repeat; do not retry every HTTP 429 or provider exception indiscriminately. The default
+does not retry unknown exceptions. Do not translate caller cancellation into a transient provider
+error. A timeout means the caller stopped waiting; it does not prove the remote side effect was
+rolled back. Use idempotency keys or a deduplication strategy before retrying writes, payments,
+message publishes, or other non-repeatable operations.
 
-The package is provider-neutral. Classify vendor-specific exceptions through `FailureClassifier`,
-retry only operations with documented idempotency semantics, and keep attempts within the caller's
-deadline. The policies are process-local; distributed coordination requires a separate backend.
+## Pre-release operational checks
 
-`AsyncRateLimiter` waits asynchronously for local token-bucket capacity before a service operation
-proceeds. Its per-instance buckets are process-local and do not coordinate across worker processes;
-use a separately installed adapter when a shared or distributed quota is required. Core's own
-nonblocking limiter for HTTP/Admin responses remains part of `orbit-core` and can reject requests
-with `429` without making request handling wait for refill.
-
-```python
-from orbit_resilience import AsyncRateLimiter, resilient_call
-
-partner_api_limit = AsyncRateLimiter(limit=60, period=60)
-result = await resilient_call(
-    call_partner_api,
-    rate_limiter=partner_api_limit,
-    rate_limit_key="partner-api",
-    rate_limit_timeout=2.0,
-)
-```
-
-When combined with retries, each provider attempt acquires its own token. A rate-limit wait timeout
-is classified as local resource pressure, not as an upstream transient failure, so the default
-retry policy does not repeat it.
-
-## Status
-
-This package is pre-alpha; its API is not stable and it is not yet a published release. It supports
-Python 3.11 through 3.14.
-
-## Production validation
-
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+Exercise concurrent load, cancellation while waiting and while running, expired deadlines,
+backoff under an overall budget, half-open recovery, key churn, and multiple worker processes.
+Confirm that metrics and logs do not expose secrets or high-cardinality raw keys. These local
+utilities do not validate distributed quota behavior or remote-service failover. The Redis adapter
+coordinates breaker state atomically while Redis is available, but replication or failover may lose
+recent writes. Use a consensus-backed store if losing a recent breaker update would violate a
+safety requirement.
